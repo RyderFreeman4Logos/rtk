@@ -21,6 +21,27 @@ pub struct Config {
     pub hooks: HooksConfig,
     #[serde(default)]
     pub limits: LimitsConfig,
+    #[serde(default)]
+    pub rewrite: RewriteConfig,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default)]
+pub struct RewriteConfig {
+    /// Built-in commands to exclude from auto-rewrite entirely (e.g.
+    /// `["grep", "git log"]`). When a command's leading tokens match a skip
+    /// entry's tokens, `rtk rewrite` short-circuits to passthrough (exit 1)
+    /// before any registry lookup, so the original command runs unmodified.
+    ///
+    /// Unlike `[hooks].exclude_commands` (which only suppresses the rewrite of
+    /// commands that have a built-in RTK equivalent), this is the user-facing
+    /// opt-out for disabling a built-in handler — e.g. when `rtk grep` mangles
+    /// source-code search or `rtk git log` shows stale output.
+    ///
+    /// Matching is token-aware prefix matching, not naive substring: `"grep"`
+    /// matches `grep ...` and bare `grep` but NOT `grepfoo` or `ripgrep`;
+    /// `"git log"` matches `git log ...` but NOT `git status` or `git logfoo`.
+    #[serde(default)]
+    pub skip: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -249,6 +270,33 @@ exclude_commands = ["curl"]
         let config: Config = toml::from_str(toml).expect("valid toml");
         assert_eq!(config.hooks.exclude_commands, vec!["curl"]);
         assert!(config.hooks.transparent_prefixes.is_empty());
+    }
+
+    #[test]
+    fn test_rewrite_config_skip_deserialize() {
+        let toml = r#"
+[rewrite]
+skip = ["grep", "git log"]
+"#;
+        let config: Config = toml::from_str(toml).expect("valid toml");
+        assert_eq!(config.rewrite.skip, vec!["grep", "git log"]);
+    }
+
+    #[test]
+    fn test_rewrite_config_default_empty() {
+        let config = Config::default();
+        assert!(config.rewrite.skip.is_empty());
+    }
+
+    #[test]
+    fn test_rewrite_config_missing_section_is_empty() {
+        // Configs that predate the [rewrite] section must still parse.
+        let toml = r#"
+[hooks]
+exclude_commands = ["curl"]
+"#;
+        let config: Config = toml::from_str(toml).expect("valid toml");
+        assert!(config.rewrite.skip.is_empty());
     }
 
     #[test]

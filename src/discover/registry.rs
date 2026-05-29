@@ -482,6 +482,7 @@ pub fn rewrite_command(
     cmd: &str,
     excluded: &[String],
     transparent_prefixes: &[String],
+    skip: &[String],
 ) -> Option<String> {
     // Bash line continuations (`\<NL>`, `\<CRLF>`) and the leading whitespace that
     // follows are syntactically equivalent to a single space, but `cmd.trim()` does
@@ -490,6 +491,13 @@ pub fn rewrite_command(
     let normalized = collapse_line_continuations(cmd);
     let trimmed = normalized.trim();
     if trimmed.is_empty() {
+        return None;
+    }
+
+    // User opt-out: if the command's leading tokens match a `[rewrite].skip`
+    // entry, short-circuit to passthrough (None → caller exits 1) BEFORE any
+    // registry lookup, so the original command runs unmodified.
+    if command_matches_skip(trimmed, skip) {
         return None;
     }
 
@@ -513,6 +521,30 @@ pub fn rewrite_command(
     }
 
     rewrite_compound(trimmed, &compiled, &normalized_prefixes)
+}
+
+/// Token-aware prefix match of a command against the `[rewrite].skip` list.
+///
+/// Returns `true` when the whitespace-split tokens of any skip entry exactly
+/// equal the command's *leading* tokens. This is a prefix match on whole
+/// tokens, NOT a substring match:
+///
+/// - `"grep"` matches `grep -rn x` and bare `grep`, but NOT `grepfoo` or
+///   `ripgrep` (different leading token).
+/// - `"git log"` matches `git log --oneline` and bare `git log`, but NOT
+///   `git status` (second token differs) or `git logfoo` (token `logfoo`
+///   != `log`).
+///
+/// An empty/whitespace-only skip entry never matches.
+fn command_matches_skip(cmd: &str, skip: &[String]) -> bool {
+    let cmd_tokens: Vec<&str> = cmd.split_whitespace().collect();
+    skip.iter().any(|entry| {
+        let entry_tokens: Vec<&str> = entry.split_whitespace().collect();
+        if entry_tokens.is_empty() || entry_tokens.len() > cmd_tokens.len() {
+            return false;
+        }
+        cmd_tokens[..entry_tokens.len()] == entry_tokens[..]
+    })
 }
 
 /// Rewrite a compound command (with `&&`, `||`, `;`, `|`) by rewriting each segment.
@@ -873,7 +905,7 @@ mod tests {
     use super::*;
 
     fn rewrite_command_no_prefixes(cmd: &str, excluded: &[String]) -> Option<String> {
-        super::rewrite_command(cmd, excluded, &[])
+        super::rewrite_command(cmd, excluded, &[], &[])
     }
 
     #[test]
@@ -3656,13 +3688,84 @@ mod tests {
         );
     }
 
+    // --- [rewrite].skip tests ---
+
+    fn rewrite_with_skip(cmd: &str, skip: &[&str]) -> Option<String> {
+        let skip: Vec<String> = skip.iter().map(|s| s.to_string()).collect();
+        super::rewrite_command(cmd, &[], &[], &skip)
+    }
+
+    #[test]
+    fn test_skip_single_token_passthrough() {
+        // skip=["grep"] => `grep -rn x` short-circuits to passthrough (None).
+        assert_eq!(rewrite_with_skip("grep -rn x", &["grep"]), None);
+        // Bare `grep` is also skipped.
+        assert_eq!(rewrite_with_skip("grep", &["grep"]), None);
+    }
+
+    #[test]
+    fn test_skip_multi_token_only_matches_full_prefix() {
+        // skip=["git log"] => `git log --oneline` is passthrough...
+        assert_eq!(rewrite_with_skip("git log --oneline", &["git log"]), None);
+        // ...but `git status` is still rewritten (second token differs).
+        assert_eq!(
+            rewrite_with_skip("git status", &["git log"]),
+            Some("rtk git status".into())
+        );
+    }
+
+    #[test]
+    fn test_skip_no_false_prefix_match() {
+        // skip=["grep"] must NOT match `ripgrep x` (different leading token)
+        // nor `grepfoo` (token `grepfoo` != `grep`). Neither has an RTK
+        // equivalent, so both return None for "no rewrite" — assert that the
+        // skip path is NOT what produced the None by confirming a *rewritable*
+        // command with the same false-prefix shape is still rewritten.
+        assert!(!command_matches_skip("ripgrep x", &["grep".to_string()]));
+        assert!(!command_matches_skip("grepfoo", &["grep".to_string()]));
+        // `git logfoo` must not be skipped by `git log` (token `logfoo` != `log`).
+        assert!(!command_matches_skip("git logfoo", &["git log".to_string()]));
+    }
+
+    #[test]
+    fn test_skip_empty_is_noop() {
+        // Empty/absent skip => identical to before: normal rewrite happens.
+        assert_eq!(
+            rewrite_with_skip("git status", &[]),
+            Some("rtk git status".into())
+        );
+        assert_eq!(
+            rewrite_with_skip("grep -rn x", &[]),
+            Some("rtk grep -rn x".into())
+        );
+    }
+
+    #[test]
+    fn test_command_matches_skip_semantics() {
+        // Positive: exact and prefix matches on whole tokens.
+        assert!(command_matches_skip("grep", &["grep".to_string()]));
+        assert!(command_matches_skip("grep -rn x", &["grep".to_string()]));
+        assert!(command_matches_skip(
+            "git log --oneline",
+            &["git log".to_string()]
+        ));
+        // Negative: substring / partial-token must not match.
+        assert!(!command_matches_skip("ripgrep", &["grep".to_string()]));
+        assert!(!command_matches_skip("grepfoo", &["grep".to_string()]));
+        assert!(!command_matches_skip("git status", &["git log".to_string()]));
+        assert!(!command_matches_skip("git", &["git log".to_string()]));
+        // Empty entry never matches; empty skip list never matches.
+        assert!(!command_matches_skip("git log", &["".to_string()]));
+        assert!(!command_matches_skip("git log", &[]));
+    }
+
     // --- transparent_prefixes tests ---
 
     #[test]
     fn test_transparent_prefix_strips_and_reprepends() {
         let prefixes = vec!["shadowenv exec --".to_string()];
         assert_eq!(
-            super::rewrite_command("shadowenv exec -- git status", &[], &prefixes),
+            super::rewrite_command("shadowenv exec -- git status", &[], &prefixes, &[]),
             Some("shadowenv exec -- rtk git status".into())
         );
     }
@@ -3671,7 +3774,7 @@ mod tests {
     fn test_transparent_prefix_with_test_runner() {
         let prefixes = vec!["shadowenv exec --".to_string()];
         assert_eq!(
-            super::rewrite_command("shadowenv exec -- cargo test", &[], &prefixes),
+            super::rewrite_command("shadowenv exec -- cargo test", &[], &prefixes, &[]),
             Some("shadowenv exec -- rtk cargo test".into())
         );
     }
@@ -3680,7 +3783,7 @@ mod tests {
     fn test_transparent_prefix_unknown_inner_returns_none() {
         let prefixes = vec!["shadowenv exec --".to_string()];
         assert_eq!(
-            super::rewrite_command("shadowenv exec -- htop", &[], &prefixes),
+            super::rewrite_command("shadowenv exec -- htop", &[], &prefixes, &[]),
             None
         );
     }
@@ -3689,7 +3792,7 @@ mod tests {
     fn test_transparent_prefix_not_matched_is_passthrough() {
         // Without the prefix configured, the wrapper breaks routing.
         assert_eq!(
-            super::rewrite_command("shadowenv exec -- git status", &[], &[]),
+            super::rewrite_command("shadowenv exec -- git status", &[], &[], &[]),
             None
         );
     }
@@ -3700,7 +3803,7 @@ mod tests {
         // user layer strips shadowenv exec --, inner `git status` routes.
         let prefixes = vec!["shadowenv exec --".to_string()];
         assert_eq!(
-            super::rewrite_command("noglob shadowenv exec -- git status", &[], &prefixes),
+            super::rewrite_command("noglob shadowenv exec -- git status", &[], &prefixes, &[]),
             Some("noglob shadowenv exec -- rtk git status".into())
         );
     }
@@ -3709,7 +3812,7 @@ mod tests {
     fn test_transparent_prefix_composed_with_env_prefix() {
         let prefixes = vec!["bundle exec".to_string()];
         assert_eq!(
-            super::rewrite_command("RAILS_ENV=test bundle exec git status", &[], &prefixes),
+            super::rewrite_command("RAILS_ENV=test bundle exec git status", &[], &prefixes, &[]),
             Some("RAILS_ENV=test bundle exec rtk git status".into())
         );
     }
@@ -3726,7 +3829,7 @@ mod tests {
     fn test_transparent_prefix_multiple_configured() {
         let prefixes = vec!["shadowenv exec --".to_string(), "direnv exec .".to_string()];
         assert_eq!(
-            super::rewrite_command("direnv exec . git status", &[], &prefixes),
+            super::rewrite_command("direnv exec . git status", &[], &prefixes, &[]),
             Some("direnv exec . rtk git status".into())
         );
     }
@@ -3749,7 +3852,7 @@ mod tests {
     fn test_transparent_prefix_overlapping_entries_use_longest_match() {
         let prefixes = vec!["docker".to_string(), "docker exec app".to_string()];
         assert_eq!(
-            super::rewrite_command("docker exec app git status", &[], &prefixes),
+            super::rewrite_command("docker exec app git status", &[], &prefixes, &[]),
             Some("docker exec app rtk git status".into())
         );
     }
@@ -3759,7 +3862,7 @@ mod tests {
         // A prefix `"foo"` must NOT match `"foobar git status"`.
         let prefixes = vec!["foo".to_string()];
         assert_eq!(
-            super::rewrite_command("foobar git status", &[], &prefixes),
+            super::rewrite_command("foobar git status", &[], &prefixes, &[]),
             None
         );
     }
@@ -3768,7 +3871,7 @@ mod tests {
     fn test_transparent_prefix_empty_rest_returns_none() {
         let prefixes = vec!["shadowenv exec --".to_string()];
         assert_eq!(
-            super::rewrite_command("shadowenv exec --", &[], &prefixes),
+            super::rewrite_command("shadowenv exec --", &[], &prefixes, &[]),
             None
         );
     }
@@ -3778,7 +3881,7 @@ mod tests {
         // A blank entry in the config should not cause spurious matches or panics.
         let prefixes = vec!["".to_string(), "   ".to_string()];
         assert_eq!(
-            super::rewrite_command("git status", &[], &prefixes),
+            super::rewrite_command("git status", &[], &prefixes, &[]),
             Some("rtk git status".into())
         );
     }
@@ -3791,7 +3894,8 @@ mod tests {
             super::rewrite_command(
                 "shadowenv exec -- git status && shadowenv exec -- cargo test",
                 &[],
-                &prefixes
+                &prefixes,
+                &[]
             ),
             Some("shadowenv exec -- rtk git status && shadowenv exec -- rtk cargo test".into())
         );
@@ -3804,7 +3908,7 @@ mod tests {
         let prefixes = vec!["shadowenv exec --".to_string()];
         let excluded = vec!["git".to_string()];
         assert_eq!(
-            super::rewrite_command("shadowenv exec -- git status", &excluded, &prefixes),
+            super::rewrite_command("shadowenv exec -- git status", &excluded, &prefixes, &[]),
             None
         );
     }
@@ -3821,7 +3925,7 @@ mod tests {
         cmd.push_str("git status");
         // Doesn't matter exactly what it returns — just that it doesn't stack-
         // overflow or loop forever. Exercise the code path.
-        let _ = super::rewrite_command(&cmd, &[], &prefixes);
+        let _ = super::rewrite_command(&cmd, &[], &prefixes, &[]);
     }
 
     #[test]
