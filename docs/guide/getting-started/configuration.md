@@ -49,6 +49,9 @@ enabled = true              # anonymous daily ping — see Telemetry & Privacy f
 
 [hooks]
 exclude_commands = []       # commands to never auto-rewrite
+
+[rewrite]
+skip = []                   # built-in commands to opt out of rewriting entirely
 ```
 
 For full details on what is collected, opt-out options, and GDPR rights, see [Telemetry & Privacy](../resources/telemetry.md).
@@ -109,6 +112,31 @@ Or for a single invocation:
 ```bash
 RTK_DISABLED=1 git rebase main
 ```
+
+## Opting out of built-in rewrites
+
+`[hooks].exclude_commands` only suppresses the rewrite of commands that have a
+built-in RTK equivalent in a way that still routes through the registry. To
+fully opt out of a built-in handler — so the command passes through untouched
+before any rewrite is computed — use `[rewrite].skip`:
+
+```toml
+[rewrite]
+skip = ["grep", "git log"]
+```
+
+This is the user-facing opt-out for when a built-in compaction is undesirable —
+for example when `rtk grep` mangles source-code search, or `rtk git log` shows
+stale output and you want the raw `git log` instead.
+
+Matching is **token-aware prefix matching**, not naive substring matching. A
+skip entry's whitespace-split tokens must equal the command's leading tokens:
+
+- `"grep"` matches `grep -rn foo` and bare `grep`, but **not** `ripgrep foo` or `grepfoo`.
+- `"git log"` matches `git log --oneline`, but **not** `git status` or `git logfoo`.
+
+A matched command short-circuits to passthrough (the hook leaves it unchanged),
+so the original command runs as-is.
 
 ## Telemetry
 

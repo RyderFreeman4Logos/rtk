@@ -107,11 +107,17 @@ fn get_rewritten(cmd: &str) -> Option<String> {
         return None;
     }
 
-    let (excluded, transparent_prefixes) = crate::core::config::Config::load()
-        .map(|c| (c.hooks.exclude_commands, c.hooks.transparent_prefixes))
+    let (excluded, transparent_prefixes, skip) = crate::core::config::Config::load()
+        .map(|c| {
+            (
+                c.hooks.exclude_commands,
+                c.hooks.transparent_prefixes,
+                c.rewrite.skip,
+            )
+        })
         .unwrap_or_default();
 
-    let rewritten = rewrite_command(cmd, &excluded, &transparent_prefixes)?;
+    let rewritten = rewrite_command(cmd, &excluded, &transparent_prefixes, &skip)?;
 
     if rewritten == cmd {
         return None;
@@ -211,11 +217,17 @@ pub fn run_gemini() -> Result<()> {
         return Ok(());
     }
 
-    let (excluded, transparent_prefixes) = crate::core::config::Config::load()
-        .map(|c| (c.hooks.exclude_commands, c.hooks.transparent_prefixes))
+    let (excluded, transparent_prefixes, skip) = crate::core::config::Config::load()
+        .map(|c| {
+            (
+                c.hooks.exclude_commands,
+                c.hooks.transparent_prefixes,
+                c.rewrite.skip,
+            )
+        })
         .unwrap_or_default();
 
-    match rewrite_command(cmd, &excluded, &transparent_prefixes) {
+    match rewrite_command(cmd, &excluded, &transparent_prefixes, &skip) {
         Some(ref rewritten) => {
             audit_log("rewrite", cmd, rewritten);
             print_rewrite(rewritten);
@@ -528,7 +540,7 @@ mod tests {
     use super::*;
 
     fn rewrite_command_no_prefixes(cmd: &str, excluded: &[String]) -> Option<String> {
-        crate::discover::registry::rewrite_command(cmd, excluded, &[])
+        crate::discover::registry::rewrite_command(cmd, excluded, &[], &[])
     }
 
     // --- Copilot format detection ---

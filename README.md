@@ -381,10 +381,20 @@ For per-agent setup details, override controls, and graceful degradation, see th
 [hooks]
 exclude_commands = ["curl", "playwright"]  # skip rewrite for these
 
+[rewrite]
+skip = ["grep", "git log"]  # opt out of rewriting these built-in commands
+
 [tee]
 enabled = true          # save raw output on failure (default: true)
 mode = "failures"       # "failures", "always", or "never"
 ```
+
+`[rewrite].skip` disables RTK's built-in rewrite for specific commands so they
+run unmodified — useful when `rtk grep` mangles source-code search or `rtk git
+log` shows stale output. Matching is token-aware prefix matching, not substring:
+`"grep"` matches `grep ...` and bare `grep` but never `ripgrep` or `grepfoo`;
+`"git log"` matches `git log ...` but not `git status` or `git logfoo`. A matched
+command short-circuits to passthrough before any rewrite is computed.
 
 When a command fails, RTK saves the full unfiltered output so the LLM can read it without re-executing:
 
