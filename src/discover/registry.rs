@@ -3724,7 +3724,10 @@ mod tests {
         assert!(!command_matches_skip("ripgrep x", &["grep".to_string()]));
         assert!(!command_matches_skip("grepfoo", &["grep".to_string()]));
         // `git logfoo` must not be skipped by `git log` (token `logfoo` != `log`).
-        assert!(!command_matches_skip("git logfoo", &["git log".to_string()]));
+        assert!(!command_matches_skip(
+            "git logfoo",
+            &["git log".to_string()]
+        ));
     }
 
     #[test]
@@ -3752,7 +3755,10 @@ mod tests {
         // Negative: substring / partial-token must not match.
         assert!(!command_matches_skip("ripgrep", &["grep".to_string()]));
         assert!(!command_matches_skip("grepfoo", &["grep".to_string()]));
-        assert!(!command_matches_skip("git status", &["git log".to_string()]));
+        assert!(!command_matches_skip(
+            "git status",
+            &["git log".to_string()]
+        ));
         assert!(!command_matches_skip("git", &["git log".to_string()]));
         // Empty entry never matches; empty skip list never matches.
         assert!(!command_matches_skip("git log", &["".to_string()]));

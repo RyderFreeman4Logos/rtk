@@ -1,0 +1,45 @@
+# Lefthook — git hooks manager
+# Install: just install-hooks   (or: lefthook install)
+# Docs: https://github.com/evilmartians/lefthook
+#
+# Adapted from ../cli-sub-agent/lefthook.yml for rtk:
+#   - pre-commit runs branch-protection + the FAST gate (fmt + clippy, no tests)
+#     so commits stay snappy.
+#   - pre-push runs branch-protection (backstop against direct pushes to
+#     main/dev/master that bypassed pre-commit) + the csa review gate
+#     (review-check.sh) + the test suite before work is shared. review-check.sh
+#     honours CSA_SKIP_REVIEW_CHECK=1 (dev2merge sets it after its own Step 11
+#     review) and skips inside CSA executor sessions.
+#   - NO version-check hook: rtk versions via release-please, so feature branches
+#     intentionally do NOT bump Cargo.toml (that would fight the release PR).
+
+# Suppress the interactive spinner in non-TTY contexts (CSA daemon sessions, CI,
+# piped invocations). Without this, lefthook renders spinner frames with \r that
+# accumulate as literal bytes in captured logs.
+no_tty: true
+
+pre-commit:
+  commands:
+    branch-protection:
+      run: scripts/hooks/branch-protection.sh
+    quality-gates:
+      run: just pre-commit-fast
+
+pre-push:
+  commands:
+    # Re-run branch protection at push time, not just pre-commit. Commits can
+    # reach a protected branch without ever invoking pre-commit (local merge
+    # commits, cherry-picks/imports, or commits made before hooks were
+    # installed); this is the backstop that blocks a direct push while HEAD is
+    # on main/dev/master in those cases (AGENTS rule 056).
+    # NOTE: keys off the CURRENT branch. An explicit-refspec push to a protected
+    # remote ref (e.g. `git push origin x:main`) is NOT catchable here — lefthook
+    # gives a command no push refspec on stdin/env — so that case is covered by
+    # GitHub server-side branch protection. See branch-protection.sh for the
+    # full rationale.
+    branch-protection:
+      run: scripts/hooks/branch-protection.sh
+    review-check:
+      run: scripts/hooks/review-check.sh
+    tests:
+      run: just test
