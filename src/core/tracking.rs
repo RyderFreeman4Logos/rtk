@@ -336,6 +336,18 @@ impl Tracker {
     }
 
     #[cfg(test)]
+    fn new_at_path(db_path: &std::path::Path) -> Result<Self> {
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent).context("Failed to create test DB parent directory")?;
+        }
+
+        let conn = Connection::open(db_path).context("Failed to open test tracking DB")?;
+        let tracker = Self { conn };
+        tracker.init_schema()?;
+        Ok(tracker)
+    }
+
+    #[cfg(test)]
     fn init_schema(&self) -> Result<()> {
         self.conn.execute(
             "CREATE TABLE IF NOT EXISTS commands (
@@ -1369,6 +1381,28 @@ impl TimedExecution {
         }
     }
 
+    #[cfg(test)]
+    fn track_to_tracker(
+        &self,
+        tracker: &Tracker,
+        original_cmd: &str,
+        rtk_cmd: &str,
+        input: &str,
+        output: &str,
+    ) -> Result<()> {
+        let elapsed_ms = self.start.elapsed().as_millis() as u64;
+        let input_tokens = estimate_tokens(input);
+        let output_tokens = estimate_tokens(output);
+
+        tracker.record(
+            original_cmd,
+            rtk_cmd,
+            input_tokens,
+            output_tokens,
+            elapsed_ms,
+        )
+    }
+
     /// Track passthrough commands (timing-only, no token counting).
     ///
     /// For commands that stream output or run interactively where output
@@ -1395,6 +1429,17 @@ impl TimedExecution {
         if let Ok(tracker) = Tracker::new() {
             let _ = tracker.record(original_cmd, rtk_cmd, 0, 0, elapsed_ms);
         }
+    }
+
+    #[cfg(test)]
+    fn track_passthrough_to_tracker(
+        &self,
+        tracker: &Tracker,
+        original_cmd: &str,
+        rtk_cmd: &str,
+    ) -> Result<()> {
+        let elapsed_ms = self.start.elapsed().as_millis() as u64;
+        tracker.record(original_cmd, rtk_cmd, 0, 0, elapsed_ms)
     }
 }
 
@@ -1447,7 +1492,7 @@ mod tests {
     // 3. Tracker::record + get_recent — round-trip DB
     #[test]
     fn test_tracker_record_and_recent() {
-        let tracker = Tracker::new().expect("Failed to create tracker");
+        let tracker = Tracker::new_in_memory().expect("Failed to create in-memory tracker");
 
         // Use unique test identifier to avoid conflicts with other tests
         let test_cmd = format!("rtk git status test_{}", std::process::id());
@@ -1471,7 +1516,7 @@ mod tests {
     // 4. track_passthrough doesn't dilute stats (input=0, output=0)
     #[test]
     fn test_track_passthrough_no_dilution() {
-        let tracker = Tracker::new().expect("Failed to create tracker");
+        let tracker = Tracker::new_in_memory().expect("Failed to create in-memory tracker");
 
         // Use unique test identifiers
         let pid = std::process::id();
@@ -1515,12 +1560,24 @@ mod tests {
     // 5. TimedExecution::track records with exec_time > 0
     #[test]
     fn test_timed_execution_records_time() {
+        let temp_dir = tempfile::tempdir().expect("create temp tracking directory");
+        let db_path = temp_dir.path().join("history.db");
+        let writer = Tracker::new_at_path(&db_path).expect("Failed to create writer tracker");
+
         let timer = TimedExecution::start();
         std::thread::sleep(std::time::Duration::from_millis(10));
-        timer.track("test cmd", "rtk test", "raw input data", "filtered");
+        timer
+            .track_to_tracker(
+                &writer,
+                "test cmd",
+                "rtk test",
+                "raw input data",
+                "filtered",
+            )
+            .expect("Failed to record timed execution");
 
-        // Verify via DB that record exists
-        let tracker = Tracker::new().expect("Failed to create tracker");
+        // Verify via a separate reader instance that the DB round-trip works.
+        let tracker = Tracker::new_at_path(&db_path).expect("Failed to create reader tracker");
         let recent = tracker.get_recent(5).expect("Failed to get recent");
         assert!(recent.iter().any(|r| r.rtk_cmd == "rtk test"));
     }
@@ -1528,10 +1585,16 @@ mod tests {
     // 6. TimedExecution::track_passthrough records with 0 tokens
     #[test]
     fn test_timed_execution_passthrough() {
-        let timer = TimedExecution::start();
-        timer.track_passthrough("git tag", "rtk git tag (passthrough)");
+        let temp_dir = tempfile::tempdir().expect("create temp tracking directory");
+        let db_path = temp_dir.path().join("history.db");
+        let writer = Tracker::new_at_path(&db_path).expect("Failed to create writer tracker");
 
-        let tracker = Tracker::new().expect("Failed to create tracker");
+        let timer = TimedExecution::start();
+        timer
+            .track_passthrough_to_tracker(&writer, "git tag", "rtk git tag (passthrough)")
+            .expect("Failed to record passthrough timed execution");
+
+        let tracker = Tracker::new_at_path(&db_path).expect("Failed to create reader tracker");
         let recent = tracker.get_recent(5).expect("Failed to get recent");
 
         let pt = recent
@@ -1609,7 +1672,7 @@ mod tests {
     // 12. record_parse_failure + get_parse_failure_summary roundtrip
     #[test]
     fn test_parse_failure_roundtrip() {
-        let tracker = Tracker::new().expect("Failed to create tracker");
+        let tracker = Tracker::new_in_memory().expect("Failed to create in-memory tracker");
         let test_cmd = format!("git -C /path status test_{}", std::process::id());
 
         tracker
@@ -1627,7 +1690,7 @@ mod tests {
     // 13. recovery_rate calculation
     #[test]
     fn test_parse_failure_recovery_rate() {
-        let tracker = Tracker::new().expect("Failed to create tracker");
+        let tracker = Tracker::new_in_memory().expect("Failed to create in-memory tracker");
         let pid = std::process::id();
 
         // 2 successes, 1 failure
