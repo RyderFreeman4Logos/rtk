@@ -63,6 +63,14 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
 }
 
 fn filter_curl_output(raw: &str, is_tty: bool) -> FilterResult<'_> {
+    filter_curl_output_with_hint(raw, is_tty, |body| force_tee_hint(body, "curl"))
+}
+
+fn filter_curl_output_with_hint<'a>(
+    raw: &'a str,
+    is_tty: bool,
+    write_hint: impl FnOnce(&str) -> Option<String>,
+) -> FilterResult<'a> {
     let trimmed = raw.trim();
 
     // Heuristic: looks like a top-level JSON document. Numbers / booleans / null
@@ -88,7 +96,7 @@ fn filter_curl_output(raw: &str, is_tty: bool) -> FilterResult<'_> {
 
     // We're about to truncate for a human reader. Write a tee file so they (or
     // the LLM in their stead) can recover the full body from the printed hint.
-    let Some(hint) = force_tee_hint(raw, "curl") else {
+    let Some(hint) = write_hint(raw) else {
         // Tee disabled (RTK_TEE=0 or below MIN_TEE_SIZE): we have nowhere to
         // point a recovery hint to, so pass through rather than emit an
         // unrecoverable truncation marker.
@@ -122,6 +130,16 @@ struct FilterResult<'a> {
 mod tests {
     use super::*;
 
+    fn filter_curl_output_in_dir<'a>(
+        raw: &'a str,
+        is_tty: bool,
+        tee_dir: &std::path::Path,
+    ) -> FilterResult<'a> {
+        filter_curl_output_with_hint(raw, is_tty, |body| {
+            crate::core::tee::force_tee_hint_in_dir(body, "curl", tee_dir)
+        })
+    }
+
     #[test]
     fn test_filter_curl_json_small_no_tee_hint() {
         let output = r#"{"r2Ready":true,"status":"ok"}"#;
@@ -139,8 +157,9 @@ mod tests {
 
     #[test]
     fn test_filter_curl_long_output_truncated() {
+        let tee_dir = tempfile::tempdir().expect("create temp tee directory");
         let long: String = "x".repeat(1000);
-        let result = filter_curl_output(&long, true);
+        let result = filter_curl_output_in_dir(&long, true, tee_dir.path());
         assert!(result.content.starts_with('x'));
         assert!(result.content.contains("bytes total"));
         assert!(result.content.contains("1000"));
@@ -150,16 +169,18 @@ mod tests {
 
     #[test]
     fn test_filter_curl_multibyte_boundary() {
+        let tee_dir = tempfile::tempdir().expect("create temp tee directory");
         let content = "a".repeat(499) + "é";
-        let result = filter_curl_output(&content, true);
+        let result = filter_curl_output_in_dir(&content, true, tee_dir.path());
         assert!(result.content.contains("bytes total"));
         assert!(result.content.len() < 600);
     }
 
     #[test]
     fn test_filter_curl_exact_500_bytes() {
+        let tee_dir = tempfile::tempdir().expect("create temp tee directory");
         let content = "a".repeat(500);
-        let result = filter_curl_output(&content, true);
+        let result = filter_curl_output_in_dir(&content, true, tee_dir.path());
         assert!(result.content.contains("bytes total"));
     }
 

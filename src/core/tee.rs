@@ -221,6 +221,26 @@ pub fn force_tee_hint(raw: &str, command_slug: &str) -> Option<String> {
     Some(format_hint(&path))
 }
 
+#[cfg(test)]
+pub(crate) fn force_tee_hint_in_dir(
+    raw: &str,
+    command_slug: &str,
+    tee_dir: &std::path::Path,
+) -> Option<String> {
+    if raw.is_empty() {
+        return None;
+    }
+
+    let path = write_tee_file(
+        raw,
+        command_slug,
+        tee_dir,
+        DEFAULT_MAX_FILE_SIZE,
+        DEFAULT_MAX_FILES,
+    )?;
+    Some(format_hint(&path))
+}
+
 /// Returns `[see remaining: tail -n +{line_offset} ~/path]`, or None if tee is disabled/skipped.
 pub fn force_tee_tail_hint(
     content: &str,
