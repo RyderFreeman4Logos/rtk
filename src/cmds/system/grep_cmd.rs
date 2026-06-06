@@ -8,68 +8,72 @@ use anyhow::{Context, Result};
 use regex::Regex;
 use std::collections::HashMap;
 
-#[allow(clippy::too_many_arguments)]
-pub fn run(
-    pattern: &str,
-    path: &str,
+const DEFAULT_MAX_LINE_LEN: usize = 80;
+const DEFAULT_MAX_RESULTS: usize = 200;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GrepSearch {
+    pattern: String,
+    pattern_from_rg_args: bool,
+    had_pattern_terminator: bool,
+    paths: Vec<String>,
     max_line_len: usize,
     max_results: usize,
     context_only: bool,
-    file_type: Option<&str>,
-    extra_args: &[String],
-    verbose: u8,
-) -> Result<i32> {
+    rg_args: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GrepInvocation {
+    Search(GrepSearch),
+    RgPassthrough(Vec<String>),
+}
+
+pub fn run_from_args(args: &[String], verbose: u8) -> Result<i32> {
+    match parse_grep_args(args)? {
+        GrepInvocation::Search(search) => run_search(&search, verbose),
+        GrepInvocation::RgPassthrough(rg_args) => run_rg_passthrough(&rg_args),
+    }
+}
+
+fn run_search(search: &GrepSearch, verbose: u8) -> Result<i32> {
     let timer = tracking::TimedExecution::start();
 
     if verbose > 0 {
-        eprintln!("grep: '{}' in {}", pattern, path);
+        eprintln!("grep: '{}' in {}", search.pattern, search.paths.join(" "));
     }
 
     // Fix: convert BRE alternation \| → | for rg (which uses PCRE-style regex)
-    let rg_pattern = pattern.replace(r"\|", "|");
+    let rg_pattern = search.pattern.replace(r"\|", "|");
 
     let mut rg_cmd = resolved_command("rg");
-    // --no-ignore-vcs: match grep -r behavior (don't skip .gitignore'd files).
-    // Without this, rg returns 0 matches for files in .gitignore, causing
-    // false negatives that make AI agents draw wrong conclusions.
-    // Using --no-ignore-vcs (not --no-ignore) so .ignore/.rgignore are still respected.
-    // -H: always emit the filename.
-    // -0: NUL-separate filename. Allows the parser to disambiguate filenames or
-    // content containing `:digits:` patterns (issue #1436).
-    rg_cmd.args(["-nH0", "--no-heading", "--no-ignore-vcs", &rg_pattern, path]);
-
-    if let Some(ft) = file_type {
-        rg_cmd.arg("--type").arg(ft);
-    }
-
-    for arg in extra_args {
-        // Fix: skip grep-ism -r flag (rg is recursive by default; rg -r means --replace)
-        if arg == "-r" || arg == "--recursive" {
-            continue;
-        }
-        rg_cmd.arg(arg);
-    }
+    rg_cmd.args(build_rg_args(search, &rg_pattern));
 
     let result = exec_capture(&mut rg_cmd)
         .or_else(|_| {
             let mut grep_cmd = resolved_command("grep");
-            // When we fall back to grep, include all args, not just -rnHZ.
-            grep_cmd.args(["-rnHZ", pattern, path]).args(extra_args);
+            grep_cmd.args(build_grep_fallback_args(search));
             exec_capture(&mut grep_cmd)
         })
         .context("grep/rg failed")?;
 
     // Passthrough output flags that produce output that is already small.
-    if has_format_flag(extra_args) {
+    if has_format_flag(&search.rg_args) {
         print!("{}", result.stdout);
         if !result.stderr.is_empty() {
             eprint!("{}", result.stderr.trim());
         }
 
-        let args_display = if extra_args.is_empty() {
-            format!("'{}' {}", pattern, path)
+        let paths_display = search.paths.join(" ");
+        let args_display = if search.rg_args.is_empty() {
+            format!("'{}' {}", search.pattern, paths_display)
         } else {
-            format!("{} '{}' {}", extra_args.join(" "), pattern, path)
+            format!(
+                "{} '{}' {}",
+                search.rg_args.join(" "),
+                search.pattern,
+                paths_display
+            )
         };
 
         timer.track_passthrough(
@@ -87,10 +91,10 @@ pub fn run(
         if exit_code == 2 && !result.stderr.trim().is_empty() {
             eprintln!("{}", result.stderr.trim());
         }
-        let msg = format!("0 matches for '{}'", pattern);
+        let msg = format!("0 matches for '{}'", search.pattern);
         println!("{}", msg);
         timer.track(
-            &format!("grep -rn '{}' {}", pattern, path),
+            &format!("grep -rn '{}' {}", search.pattern, search.paths.join(" ")),
             "rtk grep",
             &raw_output,
             &msg,
@@ -103,8 +107,12 @@ pub fn run(
     // (A passthrough approach yields 0% savings — no reason for RTK to exist on that path.)
     let total_matches = result.stdout.lines().count();
 
-    let context_re = if context_only {
-        Regex::new(&format!("(?i).{{0,20}}{}.*", regex::escape(pattern))).ok()
+    let context_re = if search.context_only {
+        Regex::new(&format!(
+            "(?i).{{0,20}}{}.*",
+            regex::escape(&search.pattern)
+        ))
+        .ok()
     } else {
         None
     };
@@ -114,7 +122,12 @@ pub fn run(
         let Some((file, line_num, content)) = parse_match_line(line) else {
             continue;
         };
-        let cleaned = clean_line(content, max_line_len, context_re.as_ref(), pattern);
+        let cleaned = clean_line(
+            content,
+            search.max_line_len,
+            context_re.as_ref(),
+            &search.pattern,
+        );
         by_file.entry(file).or_default().push((line_num, cleaned));
     }
 
@@ -131,13 +144,13 @@ pub fn run(
 
     let per_file = config::limits().grep_max_per_file;
     for (file, matches) in files {
-        if shown >= max_results {
+        if shown >= search.max_results {
             break;
         }
 
         let file_display = compact_path(file);
         for (line_num, content) in matches.iter().take(per_file) {
-            if shown >= max_results {
+            if shown >= search.max_results {
                 break;
             }
             rtk_output.push_str(&format!("{}:{}:{}\n", file_display, line_num, content));
@@ -151,13 +164,416 @@ pub fn run(
 
     print!("{}", rtk_output);
     timer.track(
-        &format!("grep -rn '{}' {}", pattern, path),
+        &format!("grep -rn '{}' {}", search.pattern, search.paths.join(" ")),
         "rtk grep",
         &raw_output,
         &rtk_output,
     );
 
     Ok(exit_code)
+}
+
+fn run_rg_passthrough(rg_args: &[String]) -> Result<i32> {
+    let timer = tracking::TimedExecution::start();
+    let mut rg_cmd = resolved_command("rg");
+    rg_cmd.args(rg_args);
+    let result = exec_capture(&mut rg_cmd).context("rg failed")?;
+    print!("{}", result.stdout);
+    if !result.stderr.is_empty() {
+        eprint!("{}", result.stderr.trim());
+    }
+    let args_display = rg_args.join(" ");
+    timer.track_passthrough(
+        &format!("rg {}", args_display),
+        &format!("rtk grep {} (passthrough)", args_display),
+    );
+    Ok(result.exit_code)
+}
+
+fn parse_grep_args(args: &[String]) -> Result<GrepInvocation> {
+    let mut search = GrepSearch {
+        pattern: String::new(),
+        pattern_from_rg_args: false,
+        had_pattern_terminator: false,
+        paths: Vec::new(),
+        max_line_len: DEFAULT_MAX_LINE_LEN,
+        max_results: DEFAULT_MAX_RESULTS,
+        context_only: false,
+        rg_args: Vec::new(),
+    };
+    let mut positionals = Vec::new();
+    let mut i = 0;
+
+    while i < args.len() {
+        let arg = &args[i];
+        if arg == "--" {
+            search.had_pattern_terminator = true;
+            positionals.extend(args[i + 1..].iter().cloned());
+            break;
+        }
+
+        if arg == "--context-only" {
+            search.context_only = true;
+            i += 1;
+            continue;
+        }
+
+        if let Some(value) = arg.strip_prefix("--max-len=") {
+            search.max_line_len = parse_usize_arg("--max-len", value)?;
+            i += 1;
+            continue;
+        }
+
+        if arg == "--max-len" {
+            let Some(value) = args.get(i + 1) else {
+                anyhow::bail!("--max-len requires a value");
+            };
+            search.max_line_len = parse_usize_arg("--max-len", value)?;
+            i += 2;
+            continue;
+        }
+
+        if let Some(value) = arg.strip_prefix("--max=") {
+            search.max_results = parse_usize_arg("--max", value)?;
+            i += 1;
+            continue;
+        }
+
+        if arg == "--max" {
+            let Some(value) = args.get(i + 1) else {
+                anyhow::bail!("--max requires a value");
+            };
+            search.max_results = parse_usize_arg("--max", value)?;
+            i += 2;
+            continue;
+        }
+
+        if let Some(value) = args
+            .get(i + 1)
+            .filter(|value| (arg == "-l" || arg == "-m") && value.parse::<usize>().is_ok())
+        {
+            if arg == "-l" {
+                search.max_line_len = parse_usize_arg("-l", value)?;
+            } else {
+                search.max_results = parse_usize_arg("-m", value)?;
+            }
+            i += 2;
+            continue;
+        }
+
+        if arg == "-n" || arg == "--line-numbers" {
+            i += 1;
+            continue;
+        }
+
+        if let Some(value) = arg.strip_prefix("--type=") {
+            search.rg_args.push(format!("--type={value}"));
+            i += 1;
+            continue;
+        }
+
+        if let Some(value) = arg.strip_prefix("--file-type=") {
+            search.rg_args.push(format!("--type={value}"));
+            i += 1;
+            continue;
+        }
+
+        if let Some(value) = arg.strip_prefix("--glob=") {
+            search.rg_args.push(format!("--glob={value}"));
+            i += 1;
+            continue;
+        }
+
+        if let Some(value) = arg.strip_prefix("--type-add=") {
+            search.rg_args.push(format!("--type-add={value}"));
+            i += 1;
+            continue;
+        }
+
+        if let Some(value) = arg.strip_prefix("-t").filter(|value| !value.is_empty()) {
+            search.rg_args.push("-t".to_string());
+            search.rg_args.push(value.to_string());
+            i += 1;
+            continue;
+        }
+
+        if let Some(value) = arg.strip_prefix("-g").filter(|value| !value.is_empty()) {
+            search.rg_args.push("-g".to_string());
+            search.rg_args.push(value.to_string());
+            i += 1;
+            continue;
+        }
+
+        if arg == "--file-type" {
+            search.rg_args.push("--type".to_string());
+            let Some(value) = args.get(i + 1) else {
+                anyhow::bail!("{arg} requires a value");
+            };
+            search.rg_args.push(value.clone());
+            i += 2;
+            continue;
+        }
+
+        if let Some(value) = arg.strip_prefix("--regexp=") {
+            search.pattern_from_rg_args = true;
+            search.rg_args.push(format!("--regexp={value}"));
+            i += 1;
+            continue;
+        }
+
+        if let Some(value) = arg.strip_prefix("--file=") {
+            search.pattern_from_rg_args = true;
+            search.rg_args.push(format!("--file={value}"));
+            i += 1;
+            continue;
+        }
+
+        if takes_rg_value(arg) {
+            if is_rg_pattern_source_arg(arg) {
+                search.pattern_from_rg_args = true;
+            }
+            search.rg_args.push(arg.clone());
+            let Some(value) = args.get(i + 1) else {
+                anyhow::bail!("{arg} requires a value");
+            };
+            search.rg_args.push(value.clone());
+            i += 2;
+            continue;
+        }
+
+        if arg.starts_with('-') {
+            search.rg_args.push(arg.clone());
+            i += 1;
+            continue;
+        }
+
+        positionals.push(arg.clone());
+        i += 1;
+    }
+
+    if is_rg_passthrough_without_pattern(&search.rg_args) {
+        if search.had_pattern_terminator {
+            search.rg_args.push("--".to_string());
+        }
+        search.rg_args.extend(positionals);
+        return Ok(GrepInvocation::RgPassthrough(search.rg_args));
+    }
+
+    if search.pattern_from_rg_args {
+        search.pattern = rg_pattern_display(&search.rg_args).unwrap_or_default();
+        search.paths = if positionals.is_empty() {
+            vec![".".to_string()]
+        } else {
+            positionals
+        };
+        return Ok(GrepInvocation::Search(search));
+    }
+
+    let Some(pattern) = positionals.first() else {
+        anyhow::bail!("grep requires a pattern");
+    };
+
+    search.pattern = pattern.clone();
+    search.paths = if positionals.len() > 1 {
+        positionals[1..].to_vec()
+    } else {
+        vec![".".to_string()]
+    };
+
+    Ok(GrepInvocation::Search(search))
+}
+
+fn parse_usize_arg(name: &str, value: &str) -> Result<usize> {
+    value
+        .parse()
+        .with_context(|| format!("{name} must be a positive integer"))
+}
+
+fn takes_rg_value(arg: &str) -> bool {
+    matches!(
+        arg,
+        "-t" | "--type"
+            | "-g"
+            | "--glob"
+            | "--type-add"
+            | "-A"
+            | "--after-context"
+            | "-B"
+            | "--before-context"
+            | "-C"
+            | "--context"
+            | "-e"
+            | "--regexp"
+            | "-f"
+            | "--file"
+            | "--encoding"
+            | "--engine"
+            | "--max-count"
+            | "--max-depth"
+            | "--path-separator"
+            | "--sort"
+            | "--sortr"
+            | "--threads"
+            | "-j"
+    )
+}
+
+fn is_rg_pattern_source_arg(arg: &str) -> bool {
+    matches!(arg, "-e" | "--regexp" | "-f" | "--file")
+}
+
+fn is_rg_passthrough_without_pattern(rg_args: &[String]) -> bool {
+    rg_args.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "--type-list" | "--files" | "--help" | "-h" | "--version" | "-V"
+        )
+    })
+}
+
+fn rg_pattern_display(rg_args: &[String]) -> Option<String> {
+    let mut i = 0;
+    while i < rg_args.len() {
+        let arg = &rg_args[i];
+        if let Some(pattern) = arg.strip_prefix("--regexp=") {
+            return Some(pattern.to_string());
+        }
+        if arg == "-e" || arg == "--regexp" {
+            return rg_args.get(i + 1).cloned();
+        }
+        if let Some(pattern_file) = arg.strip_prefix("--file=") {
+            return Some(format!("patterns from {pattern_file}"));
+        }
+        if arg == "-f" || arg == "--file" {
+            return rg_args
+                .get(i + 1)
+                .map(|pattern_file| format!("patterns from {pattern_file}"));
+        }
+        i += 1;
+    }
+    None
+}
+
+fn build_rg_args(search: &GrepSearch, rg_pattern: &str) -> Vec<String> {
+    let mut args = vec![
+        "-nH0".to_string(),
+        "--no-heading".to_string(),
+        "--no-ignore-vcs".to_string(),
+    ];
+    let forwarded_args = search
+        .rg_args
+        .iter()
+        .filter(|arg| arg.as_str() != "-r" && arg.as_str() != "--recursive")
+        .cloned();
+    args.extend(forwarded_args);
+    if search.had_pattern_terminator {
+        args.push("--".to_string());
+    }
+    if !search.pattern_from_rg_args {
+        args.push(rg_pattern.to_string());
+    }
+    args.extend(search.paths.iter().cloned());
+    args
+}
+
+#[cfg(test)]
+pub(crate) fn build_rg_args_from_test_args(args: &[String]) -> Result<Vec<String>> {
+    match parse_grep_args(args)? {
+        GrepInvocation::Search(search) => Ok(build_rg_args(&search, &search.pattern)),
+        GrepInvocation::RgPassthrough(args) => Ok(args),
+    }
+}
+
+fn build_grep_fallback_args(search: &GrepSearch) -> Vec<String> {
+    let mut args = vec!["-rnHZ".to_string()];
+    args.extend(grep_fallback_extra_args(&search.rg_args));
+    if search.had_pattern_terminator {
+        args.push("--".to_string());
+    }
+    if !search.pattern_from_rg_args {
+        args.push(search.pattern.clone());
+    }
+    args.extend(search.paths.iter().cloned());
+    args
+}
+
+fn grep_fallback_extra_args(rg_args: &[String]) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut i = 0;
+
+    while i < rg_args.len() {
+        let arg = &rg_args[i];
+        if let Some(file_type) = arg.strip_prefix("--type=") {
+            push_grep_include_for_type(&mut args, file_type);
+            i += 1;
+            continue;
+        }
+        if let Some(glob) = arg.strip_prefix("--glob=") {
+            push_grep_glob(&mut args, glob);
+            i += 1;
+            continue;
+        }
+        if arg.starts_with("--type-add=") || arg == "--type-list" {
+            i += 1;
+            continue;
+        }
+        if arg == "--type" || arg == "-t" {
+            if let Some(file_type) = rg_args.get(i + 1) {
+                push_grep_include_for_type(&mut args, file_type);
+            }
+            i += 2;
+            continue;
+        }
+        if arg == "--glob" || arg == "-g" {
+            if let Some(glob) = rg_args.get(i + 1) {
+                push_grep_glob(&mut args, glob);
+            }
+            i += 2;
+            continue;
+        }
+        if arg == "--type-add" {
+            i += 2;
+            continue;
+        }
+        if arg == "-r" || arg == "--recursive" || arg == "--hidden" {
+            i += 1;
+            continue;
+        }
+        args.push(arg.clone());
+        i += 1;
+    }
+
+    args
+}
+
+fn push_grep_include_for_type(args: &mut Vec<String>, file_type: &str) {
+    if let Some(glob) = grep_glob_for_type(file_type) {
+        args.push(format!("--include={glob}"));
+    }
+}
+
+fn push_grep_glob(args: &mut Vec<String>, glob: &str) {
+    if let Some(exclude) = glob.strip_prefix('!') {
+        args.push(format!("--exclude={exclude}"));
+    } else {
+        args.push(format!("--include={glob}"));
+    }
+}
+
+fn grep_glob_for_type(file_type: &str) -> Option<&'static str> {
+    match file_type {
+        "rust" | "rs" => Some("*.rs"),
+        "py" | "python" => Some("*.py"),
+        "ts" | "typescript" => Some("*.ts"),
+        "tsx" => Some("*.tsx"),
+        "js" | "javascript" => Some("*.js"),
+        "jsx" => Some("*.jsx"),
+        "go" => Some("*.go"),
+        "java" => Some("*.java"),
+        "rb" | "ruby" => Some("*.rb"),
+        "md" | "markdown" => Some("*.md"),
+        _ => None,
+    }
 }
 
 /// Parses a single rg/grep match line of the form `file\0line_number:content`.
@@ -267,6 +683,10 @@ fn compact_path(path: &str) -> String {
 mod tests {
     use super::*;
 
+    fn strings(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| (*arg).to_string()).collect()
+    }
+
     #[test]
     fn test_clean_line() {
         let line = "            const result = someFunction();";
@@ -284,10 +704,342 @@ mod tests {
 
     #[test]
     fn test_extra_args_accepted() {
-        // Test that the function signature accepts extra_args
-        // This is a compile-time test - if it compiles, the signature is correct
+        // The parser keeps trailing rg args available for backend forwarding.
         let _extra: Vec<String> = vec!["-i".to_string(), "-A".to_string(), "3".to_string()];
-        // No need to actually run - we're verifying the parameter exists
+    }
+
+    #[test]
+    fn test_parse_rg_type_long_preserves_pattern_and_path() {
+        let invocation = parse_grep_args(&strings(&["--type", "rust", "needle", "src/"]))
+            .expect("valid grep args");
+        match invocation {
+            GrepInvocation::Search(search) => {
+                assert_eq!(search.pattern, "needle");
+                assert_eq!(search.paths, vec!["src/"]);
+                assert_eq!(search.rg_args, vec!["--type", "rust"]);
+            }
+            GrepInvocation::RgPassthrough(_) => panic!("expected search invocation"),
+        }
+    }
+
+    #[test]
+    fn test_parse_rg_type_short_preserves_pattern_and_path() {
+        let invocation =
+            parse_grep_args(&strings(&["-t", "rust", "needle", "src/"])).expect("valid grep args");
+        match invocation {
+            GrepInvocation::Search(search) => {
+                assert_eq!(search.pattern, "needle");
+                assert_eq!(search.paths, vec!["src/"]);
+                assert_eq!(search.rg_args, vec!["-t", "rust"]);
+            }
+            GrepInvocation::RgPassthrough(_) => panic!("expected search invocation"),
+        }
+    }
+
+    #[test]
+    fn test_parse_file_type_alias_maps_to_rg_type() {
+        let invocation = parse_grep_args(&strings(&[
+            "--file-type",
+            "rust",
+            "needle",
+            "src/",
+        ]))
+        .expect("valid grep args");
+        match invocation {
+            GrepInvocation::Search(search) => {
+                assert_eq!(search.pattern, "needle");
+                assert_eq!(search.paths, vec!["src/"]);
+                assert_eq!(search.rg_args, vec!["--type", "rust"]);
+            }
+            GrepInvocation::RgPassthrough(_) => panic!("expected search invocation"),
+        }
+    }
+
+    #[test]
+    fn test_parse_file_type_equals_alias_maps_to_rg_type() {
+        let invocation = parse_grep_args(&strings(&["--file-type=rust", "needle", "src/"]))
+            .expect("valid grep args");
+        match invocation {
+            GrepInvocation::Search(search) => {
+                assert_eq!(search.pattern, "needle");
+                assert_eq!(search.paths, vec!["src/"]);
+                assert_eq!(search.rg_args, vec!["--type=rust"]);
+            }
+            GrepInvocation::RgPassthrough(_) => panic!("expected search invocation"),
+        }
+    }
+
+    #[test]
+    fn test_parse_rg_glob_long_preserves_pattern_and_path() {
+        let invocation = parse_grep_args(&strings(&["--glob", "*.rs", "needle", "src/"]))
+            .expect("valid grep args");
+        match invocation {
+            GrepInvocation::Search(search) => {
+                assert_eq!(search.pattern, "needle");
+                assert_eq!(search.paths, vec!["src/"]);
+                assert_eq!(search.rg_args, vec!["--glob", "*.rs"]);
+            }
+            GrepInvocation::RgPassthrough(_) => panic!("expected search invocation"),
+        }
+    }
+
+    #[test]
+    fn test_build_rg_args_uses_regexp_flag_pattern_and_keeps_path() {
+        let invocation =
+            parse_grep_args(&strings(&["-e", "needle", "src/"])).expect("valid grep args");
+        match invocation {
+            GrepInvocation::Search(search) => {
+                assert_eq!(search.pattern, "needle");
+                assert_eq!(search.paths, vec!["src/"]);
+                assert_eq!(search.rg_args, vec!["-e", "needle"]);
+                let args = build_rg_args(&search, &search.pattern);
+                assert_eq!(
+                    args,
+                    vec![
+                        "-nH0",
+                        "--no-heading",
+                        "--no-ignore-vcs",
+                        "-e",
+                        "needle",
+                        "src/"
+                    ]
+                );
+            }
+            GrepInvocation::RgPassthrough(_) => panic!("expected search invocation"),
+        }
+    }
+
+    #[test]
+    fn test_build_rg_args_preserves_multiple_regexp_flags() {
+        let invocation = parse_grep_args(&strings(&["-e", "a", "-e", "b", "src/"]))
+            .expect("valid grep args");
+        match invocation {
+            GrepInvocation::Search(search) => {
+                assert_eq!(search.pattern, "a");
+                assert_eq!(search.paths, vec!["src/"]);
+                assert_eq!(search.rg_args, vec!["-e", "a", "-e", "b"]);
+                let args = build_rg_args(&search, &search.pattern);
+                assert_eq!(
+                    args,
+                    vec![
+                        "-nH0",
+                        "--no-heading",
+                        "--no-ignore-vcs",
+                        "-e",
+                        "a",
+                        "-e",
+                        "b",
+                        "src/"
+                    ]
+                );
+            }
+            GrepInvocation::RgPassthrough(_) => panic!("expected search invocation"),
+        }
+    }
+
+    #[test]
+    fn test_build_rg_args_uses_file_flag_pattern_and_keeps_path() {
+        let invocation = parse_grep_args(&strings(&["-f", "patterns.txt", "src/"]))
+            .expect("valid grep args");
+        match invocation {
+            GrepInvocation::Search(search) => {
+                assert_eq!(search.pattern, "patterns from patterns.txt");
+                assert_eq!(search.paths, vec!["src/"]);
+                assert_eq!(search.rg_args, vec!["-f", "patterns.txt"]);
+                let args = build_rg_args(&search, &search.pattern);
+                assert_eq!(
+                    args,
+                    vec![
+                        "-nH0",
+                        "--no-heading",
+                        "--no-ignore-vcs",
+                        "-f",
+                        "patterns.txt",
+                        "src/"
+                    ]
+                );
+            }
+            GrepInvocation::RgPassthrough(_) => panic!("expected search invocation"),
+        }
+    }
+
+    #[test]
+    fn test_build_rg_args_keeps_rg_flags_before_pattern() {
+        let invocation = parse_grep_args(&strings(&[
+            "-n", "--type", "rust", "--glob", "*.rs", "needle", "src/",
+        ]))
+        .expect("valid grep args");
+        match invocation {
+            GrepInvocation::Search(search) => {
+                let args = build_rg_args(&search, &search.pattern);
+                assert_eq!(
+                    args,
+                    vec![
+                        "-nH0",
+                        "--no-heading",
+                        "--no-ignore-vcs",
+                        "--type",
+                        "rust",
+                        "--glob",
+                        "*.rs",
+                        "needle",
+                        "src/"
+                    ]
+                );
+            }
+            GrepInvocation::RgPassthrough(_) => panic!("expected search invocation"),
+        }
+    }
+
+    #[test]
+    fn test_build_rg_args_preserves_double_dash_before_leading_hyphen_pattern_and_path() {
+        let invocation =
+            parse_grep_args(&strings(&["--", "-foo", "src/"])).expect("valid grep args");
+        match invocation {
+            GrepInvocation::Search(search) => {
+                assert_eq!(search.pattern, "-foo");
+                assert_eq!(search.paths, vec!["src/"]);
+                assert!(search.had_pattern_terminator);
+                let args = build_rg_args(&search, &search.pattern);
+                assert_eq!(
+                    args,
+                    vec!["-nH0", "--no-heading", "--no-ignore-vcs", "--", "-foo", "src/"]
+                );
+            }
+            GrepInvocation::RgPassthrough(_) => panic!("expected search invocation"),
+        }
+    }
+
+    #[test]
+    fn test_build_rg_args_preserves_double_dash_before_leading_hyphen_pattern_default_path() {
+        let invocation = parse_grep_args(&strings(&["--", "-foo"])).expect("valid grep args");
+        match invocation {
+            GrepInvocation::Search(search) => {
+                assert_eq!(search.pattern, "-foo");
+                assert_eq!(search.paths, vec!["."]);
+                assert!(search.had_pattern_terminator);
+                let args = build_rg_args(&search, &search.pattern);
+                assert_eq!(
+                    args,
+                    vec!["-nH0", "--no-heading", "--no-ignore-vcs", "--", "-foo", "."]
+                );
+            }
+            GrepInvocation::RgPassthrough(_) => panic!("expected search invocation"),
+        }
+    }
+
+    #[test]
+    fn test_build_rg_args_places_double_dash_before_paths_for_regexp_pattern_source() {
+        let invocation =
+            parse_grep_args(&strings(&["-e", "-foo", "--", "src/"])).expect("valid grep args");
+        match invocation {
+            GrepInvocation::Search(search) => {
+                assert_eq!(search.pattern, "-foo");
+                assert_eq!(search.paths, vec!["src/"]);
+                assert_eq!(search.rg_args, vec!["-e", "-foo"]);
+                assert!(search.had_pattern_terminator);
+                let args = build_rg_args(&search, &search.pattern);
+                assert_eq!(
+                    args,
+                    vec![
+                        "-nH0",
+                        "--no-heading",
+                        "--no-ignore-vcs",
+                        "-e",
+                        "-foo",
+                        "--",
+                        "src/"
+                    ]
+                );
+            }
+            GrepInvocation::RgPassthrough(_) => panic!("expected search invocation"),
+        }
+    }
+
+    #[test]
+    fn test_build_grep_fallback_preserves_double_dash_before_leading_hyphen_pattern() {
+        let invocation =
+            parse_grep_args(&strings(&["--", "-foo", "src/"])).expect("valid grep args");
+        match invocation {
+            GrepInvocation::Search(search) => {
+                let args = build_grep_fallback_args(&search);
+                assert_eq!(args, vec!["-rnHZ", "--", "-foo", "src/"]);
+            }
+            GrepInvocation::RgPassthrough(_) => panic!("expected search invocation"),
+        }
+    }
+
+    #[test]
+    fn test_parse_rg_files_passthrough_preserves_double_dash() {
+        let invocation =
+            parse_grep_args(&strings(&["--files", "--", "src/"])).expect("valid grep args");
+        match invocation {
+            GrepInvocation::RgPassthrough(args) => {
+                assert_eq!(args, vec!["--files", "--", "src/"]);
+            }
+            GrepInvocation::Search(_) => panic!("expected passthrough invocation"),
+        }
+    }
+
+    #[test]
+    fn test_build_grep_fallback_translates_rg_only_flags() {
+        let invocation = parse_grep_args(&strings(&[
+            "--type",
+            "rust",
+            "--glob",
+            "*.rs",
+            "--type-add",
+            "foo:*.foo",
+            "needle",
+            "src/",
+        ]))
+        .expect("valid grep args");
+        match invocation {
+            GrepInvocation::Search(search) => {
+                let args = build_grep_fallback_args(&search);
+                assert_eq!(
+                    args,
+                    vec!["-rnHZ", "--include=*.rs", "--include=*.rs", "needle", "src/"]
+                );
+                assert!(!args.iter().any(|arg| matches!(
+                    arg.as_str(),
+                    "--type" | "-t" | "--glob" | "-g" | "--type-add" | "--type-list"
+                )));
+            }
+            GrepInvocation::RgPassthrough(_) => panic!("expected search invocation"),
+        }
+    }
+
+    #[test]
+    fn test_parse_rg_type_list_passthrough_without_pattern() {
+        let invocation = parse_grep_args(&strings(&["--type-list"])).expect("valid grep args");
+        match invocation {
+            GrepInvocation::RgPassthrough(args) => assert_eq!(args, vec!["--type-list"]),
+            GrepInvocation::Search(_) => panic!("expected passthrough invocation"),
+        }
+    }
+
+    #[test]
+    fn test_parse_rg_files_passthrough_preserves_path() {
+        let invocation = parse_grep_args(&strings(&["--files", "src/"])).expect("valid grep args");
+        match invocation {
+            GrepInvocation::RgPassthrough(args) => assert_eq!(args, vec!["--files", "src/"]),
+            GrepInvocation::Search(_) => panic!("expected passthrough invocation"),
+        }
+    }
+
+    #[test]
+    fn test_parse_rg_trim_preserves_pattern_and_path() {
+        let invocation =
+            parse_grep_args(&strings(&["--trim", "needle", "src/"])).expect("valid grep args");
+        match invocation {
+            GrepInvocation::Search(search) => {
+                assert_eq!(search.pattern, "needle");
+                assert_eq!(search.paths, vec!["src/"]);
+                assert_eq!(search.rg_args, vec!["--trim"]);
+            }
+            GrepInvocation::RgPassthrough(_) => panic!("expected search invocation"),
+        }
     }
 
     #[test]

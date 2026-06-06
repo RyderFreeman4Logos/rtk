@@ -302,29 +302,9 @@ enum Commands {
 
     /// Compact grep - strips whitespace, truncates, groups by file
     Grep {
-        /// Pattern to search
-        pattern: String,
-        /// Path to search in
-        #[arg(default_value = ".")]
-        path: String,
-        /// Max line length
-        #[arg(short = 'l', long, default_value = "80")]
-        max_len: usize,
-        /// Max results to show
-        #[arg(short, long, default_value = "200")]
-        max: usize,
-        /// Show only match context (not full line)
-        #[arg(long)]
-        context_only: bool,
-        /// Filter by file type (e.g., ts, py, rust)
-        #[arg(short = 't', long)]
-        file_type: Option<String>,
-        /// Show line numbers (always on, accepted for grep/rg compatibility)
-        #[arg(short = 'n', long)]
-        line_numbers: bool,
-        /// Extra ripgrep arguments (e.g., -i, -A 3, -w, --glob)
+        /// Grep/ripgrep arguments
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        extra_args: Vec<String>,
+        args: Vec<String>,
     },
 
     /// Initialize rtk instructions for assistant CLI usage
@@ -1391,6 +1371,7 @@ where
 fn run_cli() -> Result<i32> {
     // Fire-and-forget telemetry ping (1/day, non-blocking)
     core::telemetry::maybe_ping();
+    let raw_argv: Vec<String> = std::env::args().collect();
 
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
@@ -1780,25 +1761,12 @@ fn run_cli() -> Result<i32> {
             summary::run(&cmd, cli.verbose)?
         }
 
-        Commands::Grep {
-            pattern,
-            path,
-            max_len,
-            max,
-            context_only,
-            file_type,
-            line_numbers: _, // no-op: line numbers always enabled in grep_cmd::run
-            extra_args,
-        } => grep_cmd::run(
-            &pattern,
-            &path,
-            max_len,
-            max,
-            context_only,
-            file_type.as_deref(),
-            &extra_args,
-            cli.verbose,
-        )?,
+        Commands::Grep { args } => {
+            let grep_args = recover_grep_args_from_raw_argv(&raw_argv)
+                .filter(|recovered_args| !recovered_args.is_empty())
+                .unwrap_or(args);
+            grep_cmd::run_from_args(&grep_args, cli.verbose)?
+        }
 
         Commands::Init {
             global,
@@ -2518,6 +2486,17 @@ fn is_operational_command(cmd: &Commands) -> bool {
     )
 }
 
+fn recover_grep_args_from_raw_argv(raw_argv: &[String]) -> Option<Vec<String>> {
+    let mut args = raw_argv.iter().skip(1);
+    while let Some(arg) = args.next() {
+        if arg.starts_with('-') {
+            continue;
+        }
+        return (arg == "grep").then(|| args.cloned().collect());
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2792,6 +2771,115 @@ mod tests {
                 _ => panic!("Expected Gain command"),
             }
         }
+    }
+
+    #[test]
+    fn test_grep_accepts_rg_type_long_before_pattern() {
+        let cli = Cli::try_parse_from(["rtk", "grep", "--type", "rust", "needle", "src/"]).unwrap();
+        match cli.command {
+            Commands::Grep { args } => {
+                assert_eq!(args, vec!["--type", "rust", "needle", "src/"]);
+            }
+            _ => panic!("Expected Grep command"),
+        }
+    }
+
+    #[test]
+    fn test_grep_accepts_rg_type_short_before_pattern() {
+        let cli = Cli::try_parse_from(["rtk", "grep", "-t", "rust", "needle", "src/"]).unwrap();
+        match cli.command {
+            Commands::Grep { args } => {
+                assert_eq!(args, vec!["-t", "rust", "needle", "src/"]);
+            }
+            _ => panic!("Expected Grep command"),
+        }
+    }
+
+    #[test]
+    fn test_grep_accepts_rg_glob_before_pattern() {
+        let cli = Cli::try_parse_from(["rtk", "grep", "--glob", "*.rs", "needle", "src/"]).unwrap();
+        match cli.command {
+            Commands::Grep { args } => {
+                assert_eq!(args, vec!["--glob", "*.rs", "needle", "src/"]);
+            }
+            _ => panic!("Expected Grep command"),
+        }
+    }
+
+    fn strings(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| item.to_string()).collect()
+    }
+
+    #[test]
+    fn test_recover_grep_args_preserves_leading_double_dash() {
+        let recovered =
+            recover_grep_args_from_raw_argv(&strings(&["rtk", "grep", "--", "-foo", "src"]))
+                .unwrap();
+        assert_eq!(recovered, vec!["--", "-foo", "src"]);
+    }
+
+    #[test]
+    fn test_recover_grep_args_keeps_no_terminator_case_distinct() {
+        let recovered =
+            recover_grep_args_from_raw_argv(&strings(&["rtk", "grep", "-foo", "src"])).unwrap();
+        assert_eq!(recovered, vec!["-foo", "src"]);
+    }
+
+    #[test]
+    fn test_recover_grep_args_skips_verbose_global_flag() {
+        let recovered =
+            recover_grep_args_from_raw_argv(&strings(&["rtk", "-v", "grep", "--", "-foo"]))
+                .unwrap();
+        assert_eq!(recovered, vec!["--", "-foo"]);
+    }
+
+    #[test]
+    fn test_recover_grep_args_skips_ultra_compact_global_flag() {
+        let recovered = recover_grep_args_from_raw_argv(&strings(&[
+            "rtk",
+            "--ultra-compact",
+            "grep",
+            "--",
+            "x",
+            "p",
+        ]))
+        .unwrap();
+        assert_eq!(recovered, vec!["--", "x", "p"]);
+    }
+
+    #[test]
+    fn test_recover_grep_args_keeps_pattern_named_grep() {
+        let recovered =
+            recover_grep_args_from_raw_argv(&strings(&["rtk", "grep", "grep", "src"])).unwrap();
+        assert_eq!(recovered, vec!["grep", "src"]);
+    }
+
+    #[test]
+    fn test_recover_grep_args_preserves_regexp_path_terminator() {
+        let recovered =
+            recover_grep_args_from_raw_argv(&strings(&["rtk", "grep", "-e", "x", "--", "src"]))
+                .unwrap();
+        assert_eq!(recovered, vec!["-e", "x", "--", "src"]);
+    }
+
+    #[test]
+    fn test_recovered_grep_args_build_rg_literal_leading_hyphen_pattern() {
+        let recovered =
+            recover_grep_args_from_raw_argv(&strings(&["rtk", "grep", "--", "-foo", "src"]))
+                .unwrap();
+        let rg_args = grep_cmd::build_rg_args_from_test_args(&recovered).expect("valid grep args");
+        let pattern_index = rg_args
+            .iter()
+            .position(|arg| arg == "-foo")
+            .expect("literal pattern should be present");
+        assert_eq!(
+            rg_args.get(pattern_index - 1).map(String::as_str),
+            Some("--")
+        );
+        assert_eq!(
+            rg_args.get(pattern_index + 1).map(String::as_str),
+            Some("src")
+        );
     }
 
     #[test]
