@@ -46,5 +46,23 @@ claudedocs
 .vitals/
 .worktrees/
 
-# icm 
+# icm
 .fastembed_cache/
+
+# CSA state — hooks append .csa/review-bypass.log and write review-gate markers
+# under .csa/state/. Tracked-ignored (not just via local .git/info/exclude) so
+# fresh clones stay clean when the review-gate bypass path runs. Per AGENTS
+# rules 036 (no-commit-ai-config) and 062 (no-commit-log-artifacts).
+.csa/
+
+# Log artifacts (AGENTS rule 062: never track logs)
+*.log
+
+# CLAUDE.md is intentionally NOT tracked in this fork (repo owner's directive).
+# It is Claude-specific AI-config, which AGENTS rule 036 (no-commit-ai-config)
+# requires NOT be committed (untracking via `git rm --cached` is the compliant
+# mechanism, not a violation). On disk it remains a symlink to the owner's
+# ignored AI-config area, so local sessions still read it. Durable contributor
+# guidance lives in CONTRIBUTING.md + docs/contributing/. Ignored here (not only
+# via global excludes / .git/info/exclude) so fresh clones never re-track it.
+/CLAUDE.md
